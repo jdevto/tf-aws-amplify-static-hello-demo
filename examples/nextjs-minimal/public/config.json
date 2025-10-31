@@ -1,0 +1,7 @@
+{
+  "tools": [
+    { "name": "Admin Portal", "url": "https://admin.example.com" },
+    { "name": "Logs", "url": "https://logs.example.com" }
+  ],
+  "dashboards": [{ "name": "KPIs", "url": "https://datastudio.google.com/" }]
+}
