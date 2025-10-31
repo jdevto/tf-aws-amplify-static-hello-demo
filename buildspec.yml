@@ -1,0 +1,102 @@
+version: 0.2
+phases:
+  install:
+    runtime-versions:
+      nodejs: 18
+    commands:
+      - echo "Installing helpers"
+      - apt-get update -y
+      - apt-get install -y jq zip curl || true
+  pre_build:
+    commands:
+      - echo "Downloading source from s3://$SOURCE_BUCKET/$SOURCE_KEY"
+      - aws s3 cp "s3://$SOURCE_BUCKET/$SOURCE_KEY" source.zip
+      - mkdir -p src
+      - unzip -q source.zip -d src
+  build:
+    commands:
+      - |
+        set -e
+        cd src
+        echo "Building in directory: $(pwd)"
+        if [ -f package-lock.json ]; then
+          npm ci
+        else
+          npm i
+        fi
+        echo "Running next build..."
+        npx next build
+        if [ ! -d out ]; then
+          echo "ERROR: Build failed - 'out' directory not found in $(pwd)"
+          ls -la
+          exit 1
+        fi
+        echo "Build successful. Creating deployment zip..."
+        cd out
+        zip -rq ../../site.zip .
+        cd ../..
+        if [ ! -f site.zip ]; then
+          echo "ERROR: site.zip not created"
+          echo "Current directory: $(pwd)"
+          echo "Contents: $(ls -la)"
+          exit 1
+        fi
+        echo "Build artifact created: site.zip ($(du -h site.zip | cut -f1))"
+  post_build:
+    commands:
+      - |
+        if [ ! -f site.zip ]; then
+          echo "ERROR: Cannot deploy - site.zip not found. Build must have failed."
+          exit 1
+        fi
+      - echo "Deploying to Amplify app $APP_ID env $ENV_NAME"
+      - |
+        echo "Checking for existing deployments..."
+        JOBS=$(aws amplify list-jobs --app-id "$APP_ID" --branch-name "$ENV_NAME" --max-results 10)
+        PENDING_JOBS=$(echo "$JOBS" | jq -r '.jobSummaries[] | select(.status == "PENDING" or .status == "RUNNING") | .jobId' | head -1)
+        if [ -n "$PENDING_JOBS" ]; then
+          echo "Found pending/running job(s): $PENDING_JOBS. Stopping..."
+          for JOB_ID in $PENDING_JOBS; do
+            aws amplify stop-job --app-id "$APP_ID" --branch-name "$ENV_NAME" --job-id "$JOB_ID" || true
+          done
+          echo "Waiting 5 seconds for jobs to stop..."
+          sleep 5
+        fi
+        echo "Creating new deployment..."
+        CREATE=$(aws amplify create-deployment --app-id "$APP_ID" --branch-name "$ENV_NAME" 2>&1)
+        CREATE_EXIT=$?
+        if [ $CREATE_EXIT -ne 0 ]; then
+          if echo "$CREATE" | grep -q "not finished"; then
+            echo "Previous job still pending. Waiting 10 seconds and retrying..."
+            sleep 10
+            CREATE=$(aws amplify create-deployment --app-id "$APP_ID" --branch-name "$ENV_NAME" 2>&1)
+            CREATE_EXIT=$?
+          fi
+          if [ $CREATE_EXIT -ne 0 ]; then
+            echo "ERROR: Failed to create Amplify deployment"
+            echo "$CREATE"
+            exit 1
+          fi
+        fi
+        URL=$(echo "$CREATE" | jq -r '.zipUploadUrl // empty')
+        JOB=$(echo "$CREATE" | jq -r '.jobId // empty')
+        if [ -z "$URL" ] || [ -z "$JOB" ] || [ "$URL" = "null" ] || [ "$JOB" = "null" ]; then
+          echo "ERROR: Invalid response from create-deployment"
+          echo "$CREATE"
+          exit 1
+        fi
+        echo "Uploading site.zip ($(du -h site.zip | cut -f1)) to $URL"
+        curl -sS -X PUT -T site.zip "$URL" -H 'Content-Type: application/zip'
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Failed to upload artifact"
+          exit 1
+        fi
+        echo "Starting deployment job $JOB"
+        aws amplify start-deployment --app-id "$APP_ID" --branch-name "$ENV_NAME" --job-id "$JOB"
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Failed to start deployment"
+          exit 1
+        fi
+        echo "Deployment started successfully"
+artifacts:
+  files: []
